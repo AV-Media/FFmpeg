@@ -109,10 +109,15 @@ const int program_birth_year = 2003;
 
 static unsigned sws_flags = SWS_BICUBIC;
 
+//ffplay用PacketQueue保存解封装后的数据，即保存AVPacket。
+//MyAVPacketList的内存是完全由PacketQueue维护的，在put的时候malloc，在get的时候free。
+//设计一个多线程安全的队列，保存AVPacket，同时统计队列内已缓存的数据大小。（这个统计数据会用来后续设置要缓存的数据量）
+//引入serial的概念，区别前后数据包是否连续
+//设计了两类特殊的packet——flush_pkt和nullpkt，用于更细致的控制（类似用于多线程编程的事件模型——往队列中放入flush事件、放入null事件）
 typedef struct MyAVPacketList {
-    AVPacket pkt;
-    struct MyAVPacketList *next;
-    int serial;
+    AVPacket pkt;               //解封装后的数据
+    struct MyAVPacketList *next;//下一个节点
+    int serial;                 //序列号
 } MyAVPacketList;
 
 typedef struct PacketQueue {
@@ -151,32 +156,40 @@ typedef struct Clock {
 } Clock;
 
 /* Common struct for handling all types of decoded data and allocated render buffers. */
+//Frame的设计试图用一个结构体“融合”3种数据：视频、音频、字幕，
+//在ffplay中，FrameQueue始终是一个线程写，另一个线程读。也就是只有一个读线程，不会有其他读线程竞争读；只有一个写线程，不会有其他线程竞争写；唯一需要的是读与写线程间的同步。
+
+//高效率的读写模型（回顾PacketQueue的设计，每次访问都需要加锁整个队列，锁范围很大）
+//高效的内存模型（节点内存以数组形式预分配，无需动态分配）
+//环形缓冲区设计，同时可以访问上一读节点
+
 typedef struct Frame {
-    AVFrame *frame;
-    AVSubtitle sub;
-    int serial;
-    double pts;           /* presentation timestamp for the frame */
-    double duration;      /* estimated duration of the frame */
-    int64_t pos;          /* byte position of the frame in the input file */
-    int width;
-    int height;
-    int format;
+    AVFrame *frame;   ////视频或音频的解码数据
+    AVSubtitle sub;   ////解码的字幕数据
+    int serial;       //帧序列
+    double pts;       /* 帧的pts presentation timestamp for the frame */
+    double duration;  /* 帧的时长 estimated duration of the frame */
+    int64_t pos;      /* 帧在输入文件所处的位置byte position of the frame in the input file */
+    int width;        //帧宽度
+    int height;       //帧高度
+    int format;       //帧格式
     AVRational sar;
     int uploaded;
     int flip_v;
 } Frame;
 
+//FrameQueue不是用链表实现队列，而是用数组实现队列（环形缓冲区）。
 typedef struct FrameQueue {
-    Frame queue[FRAME_QUEUE_SIZE];
-    int rindex;
-    int windex;
-    int size;
-    int max_size;
-    int keep_last;
-    int rindex_shown;
+    Frame queue[FRAME_QUEUE_SIZE];////队列元素，用数组模拟队列
+    int rindex;//读指针
+    int windex;//写指针
+    int size;  //当前存储的节点个数
+    int max_size; //最大允许存储的节点个数
+    int keep_last; //是否要保留最后一个读节点
+    int rindex_shown;//当前节点是否已经显示
     SDL_mutex *mutex;
     SDL_cond *cond;
-    PacketQueue *pktq;
+    PacketQueue *pktq;//关联的PacketQueue
 } FrameQueue;
 
 enum {
@@ -428,27 +441,32 @@ static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
     MyAVPacketList *pkt1;
 
-    if (q->abort_request)
+    if (q->abort_request)  ////如果已中止，则放入失败
        return -1;
 
-    pkt1 = av_malloc(sizeof(MyAVPacketList));
-    if (!pkt1)
+    pkt1 = av_malloc(sizeof(MyAVPacketList));//分配节点内存
+    if (!pkt1)  //内存不足，则放入失败
         return -1;
-    pkt1->pkt = *pkt;
+    pkt1->pkt = *pkt; //拷贝AVPacket(浅拷贝，AVPacket.data等内存并没有拷贝)
     pkt1->next = NULL;
-    if (pkt == &flush_pkt)
+    if (pkt == &flush_pkt) //如果放入的是flush_pkt，需要增加队列的序列号，以区分不连续的两段数据
         q->serial++;
-    pkt1->serial = q->serial;
+    pkt1->serial = q->serial; //用队列序列号标记节点
 
+    //队列操作：如果last_pkt为空，说明队列是空的，新增节点为队头；否则，队列有数据，则让原队尾的next为新增节点。 最后将队尾指向新增节点
     if (!q->last_pkt)
         q->first_pkt = pkt1;
     else
         q->last_pkt->next = pkt1;
+    
     q->last_pkt = pkt1;
     q->nb_packets++;
+    //将每个package的大小叠加起来
     q->size += pkt1->pkt.size + sizeof(*pkt1);
+    //将每个package的时长叠加起来
     q->duration += pkt1->pkt.duration;
     /* XXX: should duplicate packet data in DV case */
+    //发出信号，表明当前队列中有数据了，通知等待中的读线程可以取数据了
     SDL_CondSignal(q->cond);
     return 0;
 }
@@ -467,6 +485,7 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
     return ret;
 }
 
+//放入空包意味着流的结束，一般在视频读取完成的时候放入空包。
 static int packet_queue_put_nullpacket(PacketQueue *q, int stream_index)
 {
     AVPacket pkt1, *pkt = &pkt1;
@@ -477,10 +496,13 @@ static int packet_queue_put_nullpacket(PacketQueue *q, int stream_index)
     return packet_queue_put(q, pkt);
 }
 
+//初始化PacketQueue
 /* packet queue handling */
 static int packet_queue_init(PacketQueue *q)
 {
+    //重置内容为0
     memset(q, 0, sizeof(PacketQueue));
+    //创建mutex以及cond
     q->mutex = SDL_CreateMutex();
     if (!q->mutex) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
@@ -495,16 +517,19 @@ static int packet_queue_init(PacketQueue *q)
     return 0;
 }
 
+//清除队列内所有的节点
 static void packet_queue_flush(PacketQueue *q)
 {
     MyAVPacketList *pkt, *pkt1;
 
     SDL_LockMutex(q->mutex);
+    //释放每个节点
     for (pkt = q->first_pkt; pkt; pkt = pkt1) {
         pkt1 = pkt->next;
         av_packet_unref(&pkt->pkt);
         av_freep(&pkt);
     }
+    //重置PacketQueue状态
     q->last_pkt = NULL;
     q->first_pkt = NULL;
     q->nb_packets = 0;
@@ -524,6 +549,7 @@ static void packet_queue_abort(PacketQueue *q)
 {
     SDL_LockMutex(q->mutex);
 
+    //将abort_request 设置为1
     q->abort_request = 1;
 
     SDL_CondSignal(q->cond);
@@ -531,15 +557,18 @@ static void packet_queue_abort(PacketQueue *q)
     SDL_UnlockMutex(q->mutex);
 }
 
+//启用队列
 static void packet_queue_start(PacketQueue *q)
 {
     SDL_LockMutex(q->mutex);
     q->abort_request = 0;
-    packet_queue_put_private(q, &flush_pkt);
+    packet_queue_put_private(q, &flush_pkt/*这里放入了一个flush_pkt*/);
+    //flush_pkt定义是static AVPacket flush_pkt;，是一个特殊的packet，主要用来作为非连续的两端数据的“分界”标记。
     SDL_UnlockMutex(q->mutex);
 }
 
 /* return < 0 if aborted, 0 if no packet and > 0 if packet.  */
+
 static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
 {
     MyAVPacketList *pkt1;
@@ -553,24 +582,26 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *seria
             break;
         }
 
+        //从队头取出AVPacket节点
         pkt1 = q->first_pkt;
-        if (pkt1) {
-            q->first_pkt = pkt1->next;
+        if (pkt1) {//队列中有数据
+            q->first_pkt = pkt1->next;//队头移到第二个节点
             if (!q->first_pkt)
                 q->last_pkt = NULL;
-            q->nb_packets--;
-            q->size -= pkt1->pkt.size + sizeof(*pkt1);
-            q->duration -= pkt1->pkt.duration;
-            *pkt = pkt1->pkt;
+            q->nb_packets--; //节点数减1
+            q->size -= pkt1->pkt.size + sizeof(*pkt1); //cache大小扣除一个节点
+            q->duration -= pkt1->pkt.duration;//总时长扣除一个节点
+            *pkt = pkt1->pkt;//返回AVPacket，这里发生一次AVPacket结构体拷贝，AVPacket的data只拷贝了指针
             if (serial)
                 *serial = pkt1->serial;
-            av_free(pkt1);
+            av_free(pkt1);//释放节点内存
             ret = 1;
             break;
-        } else if (!block) {
+        } else if (!block) {//队列中没有数据，且非阻塞调用
             ret = 0;
             break;
         } else {
+            //队列中没有数据，且阻塞调用
             SDL_CondWait(q->cond, q->mutex);
         }
     }
@@ -687,21 +718,31 @@ static void frame_queue_unref_item(Frame *vp)
     avsubtitle_free(&vp->sub);
 }
 
+//#define VIDEO_PICTURE_QUEUE_SIZE 3
+//#define SUBPICTURE_QUEUE_SIZE 16
+//#define SAMPLE_QUEUE_SIZE 9
+//#define FRAME_QUEUE_SIZE FFMAX(SAMPLE_QUEUE_SIZE, FFMAX(VIDEO_PICTURE_QUEUE_SIZE, SUBPICTURE_QUEUE_SIZE))
+//也就是最大不超过16.
 static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int keep_last)
 {
     int i;
     memset(f, 0, sizeof(FrameQueue));
+    //初始化mutex
     if (!(f->mutex = SDL_CreateMutex())) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
         return AVERROR(ENOMEM);
     }
+    //初始化cond
     if (!(f->cond = SDL_CreateCond())) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
         return AVERROR(ENOMEM);
     }
+    //设置关联的PageQueue
     f->pktq = pktq;
     f->max_size = FFMIN(max_size, FRAME_QUEUE_SIZE);
+    //keep_last是一个bool值，表示是否在环形缓冲区的读写过程中保留最后一个读节点不被覆写。
     f->keep_last = !!keep_last;
+    //为queue的frame分配内存
     for (i = 0; i < f->max_size; i++)
         if (!(f->queue[i].frame = av_frame_alloc()))
             return AVERROR(ENOMEM);
@@ -713,7 +754,9 @@ static void frame_queue_destory(FrameQueue *f)
     int i;
     for (i = 0; i < f->max_size; i++) {
         Frame *vp = &f->queue[i];
+        //释放的内存都是关联的内存，而非结构体自身内存。
         frame_queue_unref_item(vp);
+        //用于释放AVFrame.
         av_frame_free(&vp->frame);
     }
     SDL_DestroyMutex(f->mutex);
@@ -741,23 +784,38 @@ static Frame *frame_queue_peek_last(FrameQueue *f)
 {
     return &f->queue[f->rindex];
 }
-
+//而之所以可以在无锁的情况下安全访问queue 字段，是因为上文中提到的单读单写的特殊场景。
+//首先，queue是一个预先分配好的数组，因此queue本身不发生变化，可以安全访问；
+//接着queue内的元素，读和写不存在重叠，即windex和rindex不会重叠。
+//关于“读和写不存在重叠”。因为queue数组被当做一个环形缓冲区使用，那么的确存在underrun和overrun的情况，即读过快，或写过快的情况，
+//这时如果不加控制，就会呈现缓冲区覆盖。
+//FrameQueue的精明之处在于，先通过size判断当前缓冲区内空间是否够写，或者够读，比如这里先通过一个循环的条件等待，判断f->size >= f->max_size，
+//如果f->size >= f->max_size，那么说明队列中的节点已经写满，也就是已经overrun了，此时如果再写，肯定会覆写未读数据，那么就需要继续等待。
+//调用frame_queue_peek_writable取到Frame指针后，就可以对Frame内的字段自由改写，因为只有一个写进程，且无需担心读进程覆写
 static Frame *frame_queue_peek_writable(FrameQueue *f)
 {
     /* wait until we have space to put a new frame */
     SDL_LockMutex(f->mutex);
+    //加锁情况下，等待直到队列有空余空间可写
     while (f->size >= f->max_size &&
            !f->pktq->abort_request) {
         SDL_CondWait(f->cond, f->mutex);
     }
     SDL_UnlockMutex(f->mutex);
 
+    //如果有退出请求（f->pktq->abort_request），则返回NULL
     if (f->pktq->abort_request)
         return NULL;
-
+    //返回windex位置的元素（windex指向当前应写位置）
     return &f->queue[f->windex];
 }
 
+//加锁情况下，判断是否有可读节点（f->size - f->rindex_shown > 0)
+//如果有退出请求，则返回NULL
+//读取当前可读节点(f->rindex + f->rindex_shown) % f->max_size
+
+//rindex加1，如果超过max_size，则回环为0
+//加锁情况下大小减1.
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
@@ -774,6 +832,12 @@ static Frame *frame_queue_peek_readable(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
+//windex加1，如果超过max_size，则回环为0
+//加锁情况下大小加1.
+//因为FrameQueue是基于固定长度的数组实现的队列，与链表队列不同，其节点在初始化的时候已经在队列中了，
+//push所要做的只是通过某种标志记录该节点是否是写入未读的。
+//ffplay的做法是对windex加1，将写指针移动到下一个元素，凡是windex“之前”的节点，都是写过的。
+//（至于是否可读，rindex知道；至于后续有多少空间可写，size知道）
 static void frame_queue_push(FrameQueue *f)
 {
     if (++f->windex == f->max_size)
@@ -784,12 +848,16 @@ static void frame_queue_push(FrameQueue *f)
     SDL_UnlockMutex(f->mutex);
 }
 
+//frame_queue_next用于在读完一个节点后调用，用于标记一个节点已经被读过。
 static void frame_queue_next(FrameQueue *f)
 {
+    //rindex_shown的意思是rindex指向的节点是否被读过，如果被读过， 为1，反之，为0
+    ////如果支持keep_last，且rindex_shown为0，则rindex_shown赋1，返回
     if (f->keep_last && !f->rindex_shown) {
         f->rindex_shown = 1;
         return;
     }
+    ////否则，移动rindex指针，并减小size
     frame_queue_unref_item(&f->queue[f->rindex]);
     if (++f->rindex == f->max_size)
         f->rindex = 0;
@@ -2108,6 +2176,7 @@ static int audio_thread(void *arg)
 
 static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name, void* arg)
 {
+
     packet_queue_start(d->queue);
     d->decoder_tid = SDL_CreateThread(fn, thread_name, arg);
     if (!d->decoder_tid) {
