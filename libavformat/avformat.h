@@ -2382,6 +2382,9 @@ void av_program_add_stream_index(AVFormatContext *ac, int progid, unsigned int i
  * @note  If av_find_best_stream returns successfully and decoder_ret is not
  *        NULL, then *decoder_ret is guaranteed to be set to a valid AVCodec.
  */
+//如果指定了正确的wanted_stream_nb，一般情况都是直接返回该指定流，即用户选择的流。
+//如果指定了参考流，且未指定目标流的情况，会在参考流的同一个节目中查找所需类型的流，
+//但一般结果，都是返回该类型第一个流。
 int av_find_best_stream(AVFormatContext *ic,
                         enum AVMediaType type,
                         int wanted_stream_nb,
