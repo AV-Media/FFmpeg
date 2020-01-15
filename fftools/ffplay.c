@@ -1598,12 +1598,14 @@ static double compute_target_delay(double delay, VideoState *is)
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
         /* if video is slave, we try to correct big delays by
            duplicating or deleting a frame */
+        //video时钟与音频主时钟的差值
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
         /* skip or repeat frame. We take into account the
            delay to compute the threshold. I still don't know
            if it is the best guess */
-        sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
+        //sync_threshold 介于 0.04 到 0.1 之间
+        sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN/*0.04*/, FFMIN(AV_SYNC_THRESHOLD_MAX/*0.1*/, delay));
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
             if (diff <= -sync_threshold)
                 delay = FFMAX(0, delay + diff);
@@ -1621,7 +1623,9 @@ static double compute_target_delay(double delay, VideoState *is)
 }
 
 static double vp_duration(VideoState *is, Frame *vp, Frame *nextvp) {
+    //处于同一帧
     if (vp->serial == nextvp->serial) {
+        //两帧的pts差值
         double duration = nextvp->pts - vp->pts;
         if (isnan(duration) || duration <= 0 || duration > is->max_frame_duration)
             return vp->duration;
@@ -1646,9 +1650,11 @@ static void video_refresh(void *opaque, double *remaining_time)
 
     Frame *sp, *sp2;
 
+    //使用外部时钟同步的情况，这里使用音频时钟作为同步时钟所以这里不走
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
 
+    //？？？？？？？
     if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
         time = av_gettime_relative() / 1000000.0;
         if (is->force_refresh || is->last_vis_time + rdftspeed < time) {
@@ -1661,27 +1667,35 @@ static void video_refresh(void *opaque, double *remaining_time)
     if (is->video_st) {
 retry:
         if (frame_queue_nb_remaining(&is->pictq) == 0) {
+            //帧队列中没有数据要显示则直接调用video_desplay 显示上一帧
             // nothing to do, no picture to display in the queue
         } else {
             double last_duration, duration, delay;
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
+            // 上一帧
             lastvp = frame_queue_peek_last(&is->pictq);
+            // 将要显示的帧
             vp = frame_queue_peek(&is->pictq);
 
+            //is->videoq  --> decoder --> frame_queue 当前帧
             if (vp->serial != is->videoq.serial) {
+                //这种一般是seek的时候会出现，这时候会一直去取直到取到和videoq serial一致的时候
                 frame_queue_next(&is->pictq);
                 goto retry;
             }
 
+            //？？？？？？？
             if (lastvp->serial != vp->serial)
                 is->frame_timer = av_gettime_relative() / 1000000.0;
 
+            //停止播放状态 显示上一帧
             if (is->paused)
                 goto display;
 
             /* compute nominal last_duration */
+            //当前帧pts与上一帧pts的差值 用于表示上一帧的理论显示时长
             last_duration = vp_duration(is, lastvp, vp);
             delay = compute_target_delay(last_duration, is);
 
